@@ -15,6 +15,8 @@
 from . import patch  # noqa: F401
 from . import optim  # noqa: F401
 from . import utils  # noqa: F401
+from .temporary_properties import TemporaryProperties  # noqa: F401
+from .internally_modify_temporary_properties import InternallyModifyTemporaryProperties  # noqa: F401
 
 from .optim import get_diff_optim, create_diff_optim  # noqa: F401
 from .optim import register_optim  # noqa: F401

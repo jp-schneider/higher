@@ -22,9 +22,10 @@ import weakref as _weakref
 import warnings as _warnings
 
 import torch as _torch
-
+import inspect
 from . import utils as _utils
-
+from .temporary_properties import TemporaryProperties
+from .internally_modify_temporary_properties import InternallyModifyTemporaryProperties
 # ==============================================================================
 # Helper functions and attributes for MonkeyPatch modules.
 # ==============================================================================
@@ -40,9 +41,10 @@ _BufferType = _typing.Dict[str, _typing.Optional[_torch.Tensor]]
 
 @_contextmanager
 def _modify_internally(fmodule):
-    fmodule._being_modified_internally = True
-    yield
-    fmodule._being_modified_internally = False
+    with TemporaryProperties(fmodule, _being_modified_internally=True):
+        # Fixed _modify intenally to support also nested modify internally calls, in case it will
+        # be called multiple times in hierarchy.
+        yield
 
 
 def _patched_parameters(
@@ -149,10 +151,18 @@ class _MonkeyPatchBase(_abc.ABC, _torch.nn.Module):
 def buffer_sync(
     module: _torch.nn.Module,
     fmodule: _MonkeyPatchBase,
-    device: _typing.Optional[_torch.device] = None
+    device: _typing.Optional[_torch.device] = None,
+    memo: _typing.Optional[_typing.Set[_torch.nn.Module]] = None,
 ) -> None:
     r"""One off sync (copy) of buffers in ``fmodule`` with those from ``module``.
     """
+    if memo is None:
+        memo = set()
+    if module in memo:
+        return
+    else:
+        memo.add(module)
+
     for key, value in module._buffers.items():
         if not _torch.is_tensor(value):
             fmodule._buffers[key] = value
@@ -162,13 +172,15 @@ def buffer_sync(
             fmodule._buffers[key] = value.clone().detach().to(device)
 
     for name, child in module._modules.items():
-        if name in fmodule._modules:
-            buffer_sync(child, fmodule._modules[name], device)
-        else:
-            raise KeyError(
-                "Did not find expected submodule "
-                "{} of monkey-patched module {}.".format(name, fmodule)
-            )
+        # If child was not already processed, recursively apply.
+        if child not in memo:
+            if name in fmodule._modules:
+                buffer_sync(child, fmodule._modules[name], device, memo=memo)
+            else:
+                raise KeyError(
+                    "Did not find expected submodule "
+                    "{} of monkey-patched module {}.".format(name, fmodule)
+                )
 
 
 # ==============================================================================
@@ -197,7 +209,15 @@ def _make_functional(
     params_box: _typing.Sequence[_typing.Optional[_typing.List[_torch.Tensor]]],
     params_offset: int,
     root_patched: _typing.Optional[_MonkeyPatchBase] = None,
+    memo: _typing.Optional[_typing.Dict['Module', _typing.Tuple['_MonkeyPatchBase',
+                                                                _typing.List[_typing.Callable[['_MonkeyPatchBase'], None]]]]] = None
 ) -> _typing.Tuple[int, _MonkeyPatchBase, _typing.Type[_MonkeyPatchBase]]:
+    if memo is None:
+        memo = dict()
+    if module in memo:
+        return None, None, None
+    else:
+        memo[module] = (None, list())  # Module use currently empty
 
     if isinstance(module, _MonkeyPatchBase):
         raise ValueError(
@@ -278,7 +298,6 @@ def _make_functional(
                     fast_params[replacement_index] = value
                     self.update_params(fast_params)
 
-
                 # Change parameters in place, usually during boxed_forward pass
                 self._parameters[name] = value
             else:
@@ -345,20 +364,30 @@ def _make_functional(
 
     child_params_offset = params_offset + num_params
     for name, child in module._modules.items():
-        child_params_offset, fchild, _ = _make_functional(
-            child, params_box, child_params_offset, root_patched
-        )
-        fmodule._modules[name] = fchild
-        setattr(fmodule, name, fchild)
+        if child not in memo:
+            child_params_offset, fchild, _ = _make_functional(
+                child, params_box, child_params_offset, root_patched, memo=memo
+            )
+            fmodule._modules[name] = fchild
+            setattr(fmodule, name, fchild)
+        else:
+            # Cyclic reference on a predefined module.
+            # Add the reference within a finelizer
+            _, finelizers = memo[child]
+
+            def restore_cycle_reference(parent):
+                with _modify_internally(fmodule):
+                    setattr(fmodule, name, parent)
+            finelizers.append(restore_cycle_reference)
 
     true_forward = type(module).forward
 
     def patched_forward(self, *args, params=None, **kwargs):
         if self.direct_submodule_call:
             # If submodule was called directly, run intialisation that happens
-            # at top level call. If *full set of params* is provided here, it 
+            # at top level call. If *full set of params* is provided here, it
             # will use those. If not, it will fall back on fast weights.
-            # In the future, we should be able to support passing only the 
+            # In the future, we should be able to support passing only the
             # submodule (+ children) weights here, but that's not simple.
             self.root._refill_params_box(params)
 
@@ -383,7 +412,7 @@ def _make_functional(
             is_RNN = isinstance(module, _torch.nn.RNNBase)
             if is_RNN and _torch.cuda.is_available():
                 _warnings.simplefilter("ignore", category=UserWarning)
-            
+
             return true_forward(self, *args, **kwargs)
 
     setattr(MonkeyPatched, "forward", patched_forward)
@@ -395,19 +424,43 @@ def _make_functional(
     if hasattr(module, "flatten_parameters"):
         setattr(MonkeyPatched, "flatten_parameters", flatten_parameters)
 
+    # Patch all named properties
+    properties = [p
+                  for p in dir(module)
+                  if (hasattr(type(module
+                                   ), p) and isinstance(getattr(type(module
+                                                                     ), p), property))]
+    for prop_name in properties:
+        setattr(MonkeyPatched, prop_name, _patched_named_property(
+            module, prop_name, params_box, params_offset, num_params))
+
+    # Alter memo and call finilizers if any
+    _, finelizers = memo[module]
+    for finelizer in finelizers:
+        finelizer(fmodule)  # Calling finelizers if any
+
+    memo[module] = (fmodule, list()) # Empty finelizers
+
     return child_params_offset, fmodule, type(fmodule)
 
 
 def _update_patched_params(
     fmodule: _MonkeyPatchBase,
     params_box: _typing.Sequence[_typing.List[_torch.Tensor]],
-    params_offset: int
+    params_offset: int,
+    memo: _typing.Optional[_typing.Set['_MonkeyPatchBase']] = None
 ) -> int:
+    if memo is None:
+        memo = set()
+    if fmodule in memo:
+        return params_offset  # Do nothing continue as usual
+    else:
+        memo.add(fmodule)
     num_params = len([1 for p in fmodule._parameters.values() if p is not None])
     child_params_offset = params_offset + num_params
     for name, child in fmodule._modules.items():
         child_params_offset = _update_patched_params(
-            child, params_box, child_params_offset
+            child, params_box, child_params_offset, memo=memo
         )
 
     with _modify_internally(fmodule):
@@ -417,6 +470,82 @@ def _update_patched_params(
         ):
             setattr(fmodule, name, param)
     return child_params_offset
+
+
+def _patched_named_property(module: _torch.nn.Module, name: str, params_box, params_offset, num_params):
+    module_type = type(module)
+
+    property_instance = getattr(module_type, name)
+    globals_get = inspect.getclosurevars(
+        property_instance.fget).globals if property_instance.fget is not None else dict()
+    globals_set = inspect.getclosurevars(
+        property_instance.fset).globals if property_instance.fset is not None else dict()
+    globals_del = inspect.getclosurevars(
+        property_instance.fdel).globals if property_instance.fdel is not None else dict()
+
+    def _patched_inner_named_property_getter(self):
+        nonlocal name
+        nonlocal params_box
+        nonlocal params_offset
+        nonlocal num_params
+        to_alter = dict(zip(
+            self._param_names,
+            params_box[-1][params_offset:params_offset + num_params]
+        ))
+        # Add globals so the properties have the same closures
+        for imp, fnc in globals_get.items():
+            globals()[imp] = fnc
+
+        # Alter the state of the object, and call the property of the original value, but with the patched instance.
+        with InternallyModifyTemporaryProperties(self, **to_alter):
+            property_instance = getattr(module_type, name)
+            return property_instance.__get__(self)
+
+    def _patched_inner_named_property_setter(self, value):
+        nonlocal name
+        nonlocal params_box
+        nonlocal params_offset
+        nonlocal num_params
+        to_alter = dict(zip(
+            self._param_names,
+            params_box[-1][params_offset:params_offset + num_params]
+        ))
+        # Add globals so the properties have the same closures
+        for imp, fnc in globals_set.items():
+            globals()[imp] = fnc
+        # Alter the state of the object, and call the property of the original value, but with the patched instance.
+        with InternallyModifyTemporaryProperties(self, **to_alter):
+            property_instance = getattr(module_type, name)
+            return property_instance.__set__(self, value)
+
+    def _patched_inner_named_property_deleter(self):
+        nonlocal name
+        nonlocal params_box
+        nonlocal params_offset
+        nonlocal num_params
+        to_alter = dict(zip(
+            self._param_names,
+            params_box[-1][params_offset:params_offset + num_params]
+        ))
+        # Add globals so the properties have the same closures
+        for imp, fnc in globals_del.items():
+            globals()[imp] = fnc
+        # Alter the state of the object, and call the property of the original value, but with the patched instance.
+        with InternallyModifyTemporaryProperties(self, **to_alter):
+            property_instance = getattr(module_type, name)
+            return property_instance.__del__(self)
+
+    getter = None
+    setter = None
+    deleter = None
+
+    if hasattr(property_instance, "__get__") and property_instance.__get__ is not None:
+        getter = _patched_inner_named_property_getter
+    if hasattr(property_instance, "__set__") and property_instance.__set__ is not None:
+        setter = _patched_inner_named_property_setter
+    if hasattr(property_instance, "__del__") and property_instance.__del__ is not None:
+        deleter = _patched_inner_named_property_deleter
+    return property(getter, setter, deleter)
 
 
 # ==============================================================================
@@ -453,15 +582,14 @@ def make_functional(
         # Copy fast parameters into params_box for use in boxed_forward
         params_box[0] = self._expand_params(self.fast_params)
 
-
     def _patched_forward(self, *args, params=None, **kwargs):
         self._refill_params_box(params)
 
         output = self.boxed_forward(*args, **kwargs)
-        
+
         # Clean up
         params_box[0] = None
-        
+
         return output
 
     def _update_params(self, params):
@@ -473,6 +601,16 @@ def make_functional(
     setattr(MonkeyPatched, "parameters", _patched_parameters)
     setattr(MonkeyPatched, "update_params", _update_params)
     setattr(MonkeyPatched, "_refill_params_box", _refill_params_box)
+
+    # Patch all named properties
+    properties = [p
+                  for p in dir(module)
+                  if (hasattr(type(module
+                                   ), p) and isinstance(getattr(type(module
+                                                                     ), p), property))]
+    for prop_name in properties:
+        setattr(MonkeyPatched, prop_name, _patched_named_property(module, prop_name,
+                params_box, 0, len([1 for p in MonkeyPatched.parameters if p is not None])))
 
     if encapsulator is not None:
         encapsulator(fmodule, module)

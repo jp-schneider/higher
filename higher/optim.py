@@ -48,6 +48,19 @@ def _maybe_mask(tensor: _torch.Tensor, mask: _torch.Tensor) -> None:
         tensor.register_hook(_get_mask_closure(mask))
 
 
+def recursive_detach(x: _typing.Union[_torch.Tensor, _typing.List[_typing.Any], _typing.Dict[str, _typing.Any]]):
+    """Performin a copy of x and recursively detaches tensors in it."""
+    if isinstance(x, _torch.Tensor):
+        x = x.detach()
+        return x
+    elif isinstance(x, dict):
+        return {k: recursive_detach(v) for k, v in x.items()}
+    elif isinstance(x, list):
+        return [recursive_detach(v) for v in x]
+    else:
+        return x
+
+
 class DifferentiableOptimizer(_abc.ABC):
     def __init__(
         self,
@@ -264,6 +277,39 @@ class DifferentiableOptimizer(_abc.ABC):
     @_abc.abstractmethod
     def _update(self, grouped_grads: _GroupedGradsType, **kwargs) -> None:
         pass
+
+    def state_dict(self):
+        """
+        Method to get the state_dict from differentiable optimizers.
+        Inspired by: https://github.com/facebookresearch/higher/issues/93
+        """
+        param_mappings = {}
+        start_index = 0
+
+        def pack_group(group):
+            nonlocal start_index
+            packed = {k: v for k, v in group.items() if k != 'params'}
+            param_mappings.update({id(p): i for i, p in enumerate(group['params'], start_index)
+                                   if id(p) not in param_mappings})
+            packed['params'] = [param_mappings[id(p)] for p in group['params']]
+            start_index += len(packed['params'])
+            return packed
+
+        res = _collections.defaultdict(dict)
+
+        param_groups = [pack_group(g) for g in self.param_groups]
+        for group_idx, group in enumerate(self.param_groups):
+            for p_idx, p in enumerate(group['params']):
+                res[p] = {
+                    k: v for k, v in self.state[group_idx][p_idx].items()
+                }
+
+        packed_state = {(param_mappings[id(k)] if isinstance(k, _torch.Tensor) else k): recursive_detach(v)
+                        for k, v in res.items()}
+        return {
+            'state': packed_state,
+            'param_groups': param_groups
+        }
 
 
 class DifferentiableSGD(DifferentiableOptimizer):
@@ -640,9 +686,9 @@ class DifferentiableASGD(DifferentiableOptimizer):
                 # update eta and mu
                 state['eta'] = (
                     group['lr'] / _math.pow(
-                    (1 + group['lambd'] * group['lr'] * state['step']),
-                    group['alpha']
-                    )   
+                        (1 + group['lambd'] * group['lr'] * state['step']),
+                        group['alpha']
+                    )
                 )
                 state['mu'] = 1 / max(1, state['step'] - group['t0'])
 
@@ -928,9 +974,9 @@ def create_diff_optim(
             if isinstance(params[0], dict):
                 dummy = [
                     {
-                    k: _torch.zeros_like(v, requires_grad=True)
-                    if k == "params" else v
-                    for k, v in group.items()
+                        k: _torch.zeros_like(v, requires_grad=True)
+                        if k == "params" else v
+                        for k, v in group.items()
                     } for group in params
                 ]
             else:
@@ -1043,11 +1089,11 @@ def apply_trainable_opt_params(
                 "parameter groups.".format(k)
             )
         for group_idx, group in enumerate(opt.param_groups):
-            replacement = v[0] if len(v) is 1 else v[group_idx]
+            replacement = v[0] if len(v) == 1 else v[group_idx]
             group[k] = _recursive_apply(replacement, group[k])
 
 
-## Local utility functions
+# Local utility functions
 # TODO(egrefen): use funcs below instead of x._add, in diffopt
 def _add(
     tensor: _torch.Tensor,
@@ -1130,7 +1176,7 @@ def _recursive_apply(
     elif isinstance(replacement, dict) and isinstance(target, dict):
         return type(target)(
             {k: _recursive_apply(r, t)
-            for (_, r), (k, t) in zip(replacement.items(), target.items())}
+             for (_, r), (k, t) in zip(replacement.items(), target.items())}
         )
     elif isinstance(target, set):
         return type(target)(

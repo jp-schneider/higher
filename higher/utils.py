@@ -93,9 +93,17 @@ def _find_param_in_list(
 
 
 def _get_param_mapping(
-    module: _torch.nn.Module, seen: _typing.List[_torch.Tensor],
-    mapping: _typing.List[int]
+    module: _torch.nn.Module, 
+    seen: _typing.List[_torch.Tensor],
+    mapping: _typing.List[int],
+    memo: _typing.Optional[_typing.Set[_torch.nn.Module]] = None,
 ) -> _typing.List[int]:
+    if memo is None:
+        memo = set()
+    if module in memo:
+        return
+    else:
+        memo.add(module)
 
     for param in module._parameters.values():
         if param is None:
@@ -108,7 +116,7 @@ def _get_param_mapping(
             mapping.append(found)
 
     for name, child in module._modules.items():
-        _ = _get_param_mapping(child, seen, mapping)
+        _ = _get_param_mapping(child, seen, mapping, memo=memo)
 
     return mapping
 
